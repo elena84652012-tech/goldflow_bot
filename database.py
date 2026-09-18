@@ -1,20 +1,22 @@
 """
 GoldFlow — модуль работы с базой данных.
-Хранит все операции (доходы/расходы) каждого пользователя в SQLite.
+Хранит все операции (доходы/расходы) каждого пользователя в облачной базе
+PostgreSQL (Neon), чтобы данные НЕ терялись при перезапуске/засыпании бота
+на бесплатном хостинге Render.
 """
 
-import sqlite3
+import psycopg2
+import psycopg2.extras
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 
-DB_PATH = "goldflow.db"
+from config import DATABASE_URL
 
 
 @contextmanager
 def get_connection():
     """Контекстный менеджер для безопасной работы с соединением."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(DATABASE_URL)
     try:
         yield conn
         conn.commit()
@@ -22,13 +24,19 @@ def get_connection():
         conn.close()
 
 
+def _cursor(conn):
+    """Курсор, который возвращает строки как словари (row['field'])."""
+    return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+
 def init_db():
     """Создаёт таблицы, если их ещё нет. Вызывается один раз при старте бота."""
     with get_connection() as conn:
-        conn.execute("""
+        cur = _cursor(conn)
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
                 amount REAL NOT NULL,
                 category TEXT NOT NULL,
                 is_income INTEGER NOT NULL DEFAULT 0,
@@ -36,9 +44,9 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
-        conn.execute("""
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS budgets (
-                user_id INTEGER NOT NULL,
+                user_id BIGINT NOT NULL,
                 category TEXT NOT NULL,
                 limit_amount REAL NOT NULL,
                 PRIMARY KEY (user_id, category)
@@ -49,9 +57,10 @@ def init_db():
 def add_transaction(user_id: int, amount: float, category: str, is_income: bool, note: str = ""):
     """Добавляет новую операцию (доход или расход) в базу."""
     with get_connection() as conn:
-        conn.execute(
+        cur = _cursor(conn)
+        cur.execute(
             "INSERT INTO transactions (user_id, amount, category, is_income, note, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s, %s)",
             (user_id, amount, category, int(is_income), note, datetime.now().isoformat())
         )
 
@@ -59,45 +68,50 @@ def add_transaction(user_id: int, amount: float, category: str, is_income: bool,
 def get_transactions(user_id: int, days: int = None):
     """Возвращает список операций пользователя, опционально за последние N дней."""
     with get_connection() as conn:
+        cur = _cursor(conn)
         if days:
             since = (datetime.now() - timedelta(days=days)).isoformat()
-            rows = conn.execute(
-                "SELECT * FROM transactions WHERE user_id = ? AND created_at >= ? ORDER BY created_at",
+            cur.execute(
+                "SELECT * FROM transactions WHERE user_id = %s AND created_at >= %s ORDER BY created_at",
                 (user_id, since)
-            ).fetchall()
+            )
         else:
-            rows = conn.execute(
-                "SELECT * FROM transactions WHERE user_id = ? ORDER BY created_at",
+            cur.execute(
+                "SELECT * FROM transactions WHERE user_id = %s ORDER BY created_at",
                 (user_id,)
-            ).fetchall()
-        return [dict(row) for row in rows]
+            )
+        return [dict(row) for row in cur.fetchall()]
 
 
 def get_balance(user_id: int) -> float:
     """Считает текущий баланс: сумма доходов минус сумма расходов."""
     with get_connection() as conn:
-        income = conn.execute(
-            "SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND is_income = 1",
+        cur = _cursor(conn)
+        cur.execute(
+            "SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = %s AND is_income = 1",
             (user_id,)
-        ).fetchone()["total"]
-        expense = conn.execute(
-            "SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = ? AND is_income = 0",
+        )
+        income = cur.fetchone()["total"]
+        cur.execute(
+            "SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE user_id = %s AND is_income = 0",
             (user_id,)
-        ).fetchone()["total"]
-        return income - expense
+        )
+        expense = cur.fetchone()["total"]
+        return float(income) - float(expense)
 
 
 def get_expenses_by_category(user_id: int, days: int = 30):
     """Возвращает расходы, сгруппированные по категориям (для круговой диаграммы)."""
     since = (datetime.now() - timedelta(days=days)).isoformat()
     with get_connection() as conn:
-        rows = conn.execute(
+        cur = _cursor(conn)
+        cur.execute(
             "SELECT category, SUM(amount) as total FROM transactions "
-            "WHERE user_id = ? AND is_income = 0 AND created_at >= ? "
+            "WHERE user_id = %s AND is_income = 0 AND created_at >= %s "
             "GROUP BY category ORDER BY total DESC",
             (user_id, since)
-        ).fetchall()
-        return {row["category"]: row["total"] for row in rows}
+        )
+        return {row["category"]: float(row["total"]) for row in cur.fetchall()}
 
 
 def get_daily_balance_trend(user_id: int, days: int = 30):
@@ -138,9 +152,10 @@ def get_daily_balance_trend(user_id: int, days: int = 30):
 def set_budget(user_id: int, category: str, limit_amount: float):
     """Устанавливает лимит бюджета по категории."""
     with get_connection() as conn:
-        conn.execute(
-            "INSERT INTO budgets (user_id, category, limit_amount) VALUES (?, ?, ?) "
-            "ON CONFLICT(user_id, category) DO UPDATE SET limit_amount = excluded.limit_amount",
+        cur = _cursor(conn)
+        cur.execute(
+            "INSERT INTO budgets (user_id, category, limit_amount) VALUES (%s, %s, %s) "
+            "ON CONFLICT (user_id, category) DO UPDATE SET limit_amount = excluded.limit_amount",
             (user_id, category, limit_amount)
         )
 
@@ -148,20 +163,23 @@ def set_budget(user_id: int, category: str, limit_amount: float):
 def get_budgets(user_id: int):
     """Возвращает все установленные лимиты бюджета пользователя."""
     with get_connection() as conn:
-        rows = conn.execute(
-            "SELECT category, limit_amount FROM budgets WHERE user_id = ?",
+        cur = _cursor(conn)
+        cur.execute(
+            "SELECT category, limit_amount FROM budgets WHERE user_id = %s",
             (user_id,)
-        ).fetchall()
-        return {row["category"]: row["limit_amount"] for row in rows}
+        )
+        return {row["category"]: float(row["limit_amount"]) for row in cur.fetchall()}
 
 
 def get_spent_this_month(user_id: int, category: str) -> float:
     """Считает, сколько потрачено в категории с начала текущего месяца."""
     start_of_month = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     with get_connection() as conn:
-        row = conn.execute(
+        cur = _cursor(conn)
+        cur.execute(
             "SELECT COALESCE(SUM(amount), 0) as total FROM transactions "
-            "WHERE user_id = ? AND category = ? AND is_income = 0 AND created_at >= ?",
+            "WHERE user_id = %s AND category = %s AND is_income = 0 AND created_at >= %s",
             (user_id, category, start_of_month.isoformat())
-        ).fetchone()
-        return row["total"]
+        )
+        row = cur.fetchone()
+        return float(row["total"])
