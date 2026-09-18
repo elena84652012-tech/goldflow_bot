@@ -6,6 +6,7 @@ GoldFlow — Telegram-бот для личного учёта финансов.
 """
 
 import logging
+import os
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -231,6 +232,18 @@ async def handle_budget_amount(update, context):
         await update.message.reply_text("Не поняла число, попробуй ещё раз через /budget")
 
 
+async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    """Ловит любые непредвиденные ошибки, чтобы бот не падал молча."""
+    logger.error("Ошибка при обработке обновления:", exc_info=context.error)
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text(
+                "🤔 Что-то пошло не так, попробуй ещё раз."
+            )
+    except Exception:
+        pass  # если даже сообщение об ошибке не отправилось — просто не падаем
+
+
 # ---------- Запуск ----------
 
 def main():
@@ -245,10 +258,30 @@ def main():
     application.add_handler(CommandHandler("budget", budget_command))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    application.add_error_handler(error_handler)
 
-    logger.info("GoldFlow bot запущен 🚀")
-    application.run_polling()
+    # На Render (и похожих хостингах) переменная RENDER_EXTERNAL_HOSTNAME
+    # появляется автоматически — по ней понимаем, что мы в облаке, и
+    # запускаемся через вебхук (это и есть "настоящий" открытый порт,
+    # никаких обходных путей больше не нужно). Локально на компьютере
+    # этой переменной нет — тогда просто используем обычный polling.
+    port = int(os.environ.get("PORT", 10000))
+    hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+
+    if hostname:
+        webhook_url = f"https://{hostname}/{BOT_TOKEN}"
+        logger.info(f"GoldFlow bot запущен 🚀 (webhook: {webhook_url})")
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=BOT_TOKEN,
+            webhook_url=webhook_url,
+        )
+    else:
+        logger.info("GoldFlow bot запущен 🚀 (локальный режим, polling)")
+        application.run_polling()
 
 
 if __name__ == "__main__":
     main()
+
